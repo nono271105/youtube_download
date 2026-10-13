@@ -4,12 +4,19 @@ from tkinter import filedialog
 import yt_dlp
 import threading
 import os
+import sys
 import re
 import subprocess
 import urllib.request
 from pathlib import Path
 from io import BytesIO
 from PIL import Image
+
+
+def resource_path(relative: str) -> str:
+    """Return the absolute path to a bundled resource (works with PyInstaller)."""
+    base = getattr(sys, "_MEIPASS", Path(__file__).parent)
+    return str(Path(base) / relative)
 
 # ─── Thème ────────────────────────────────────────────────────────────────────
 ctk.set_appearance_mode("dark")
@@ -57,6 +64,7 @@ def fmt_speed(b: float) -> str:
 
 
 def fmt_duration(sec: int) -> str:
+    sec = int(sec)
     h, rem = divmod(sec, 3600)
     m, s   = divmod(rem, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
@@ -99,15 +107,17 @@ def bind_mousewheel(widget):
         return
 
     def _scroll(event):
-        # macOS: event.delta en unités de 120 (ou moins)
-        if event.delta:
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        if sys.platform == "darwin":
+            # macOS : delta = petites valeurs (1, 2, 3...), pas de multiples de 120
+            canvas.yview_scroll(int(-event.delta), "units")
+        elif event.delta:
+            # Windows
+            canvas.yview_scroll(int(-event.delta / 120), "units")
         elif event.num == 4:
             canvas.yview_scroll(-1, "units")
         elif event.num == 5:
             canvas.yview_scroll(1, "units")
 
-    # macOS trackpad / molette
     canvas.bind_all("<MouseWheel>", _scroll, add="+")
     # Linux
     canvas.bind_all("<Button-4>", _scroll, add="+")
@@ -123,6 +133,14 @@ class YouTubeDownloader:
         self.root.minsize(760, 600)
         self.root.resizable(True, True)
         self.root.configure(fg_color=BG_DARK)
+
+        # Icône de la fenêtre
+        _icon = resource_path("logo.ico")
+        if os.path.exists(_icon):
+            try:
+                self.root.iconbitmap(_icon)
+            except Exception:
+                pass
 
         # Variables
         self.url_var       = tk.StringVar()
@@ -472,7 +490,10 @@ class YouTubeDownloader:
                     info = ydl.extract_info(url, download=False)
                 self.root.after(0, lambda: self._apply_info(info, url))
             except Exception as exc:
-                self.root.after(0, lambda: self._apply_info_error(str(exc)))
+                # `exc` est supprimée à la sortie du bloc except :
+                # on fige le message dans une variable normale.
+                msg = str(exc)
+                self.root.after(0, lambda m=msg: self._apply_info_error(m))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -568,27 +589,31 @@ class YouTubeDownloader:
         title = (self._current_info or {}).get("title", "Chargement...")
         item  = self._create_queue_item(title, url)
 
+        # Lecture des variables Tk dans le thread principal (pas dans le worker)
+        dest        = self.download_path.get()
+        is_audio    = self.format_var.get() == "Audio MP3"
+        quality     = self.quality_var.get()
+        known_info  = self._current_info
+
         def run():
             try:
-                if not self._current_info:
+                if not known_info:
                     opts = {"quiet": True, "no_warnings": True}
                     with yt_dlp.YoutubeDL(opts) as ydl:
                         info = ydl.extract_info(url, download=False)
                     real_title = info.get("title", "Vidéo YouTube")
                     self.root.after(0, lambda t=real_title: self._update_item_title(item, t))
-                else:
-                    real_title = self._current_info.get("title", "Vidéo YouTube")
 
                 self.root.after(0, lambda: self._item_set_status(item, "En cours...", WARN))
 
                 ydl_opts = {
                     "quiet":          True,
                     "no_warnings":    True,
-                    "outtmpl":        os.path.join(self.download_path.get(), "%(title)s.%(ext)s"),
+                    "outtmpl":        os.path.join(dest, "%(title)s.%(ext)s"),
                     "progress_hooks": [lambda d: self._progress_hook(d, item)],
                 }
 
-                if self.format_var.get() == "Audio MP3":
+                if is_audio:
                     ydl_opts["format"] = "bestaudio/best"
                     ydl_opts["postprocessors"] = [{
                         "key":              "FFmpegExtractAudio",
@@ -596,20 +621,22 @@ class YouTubeDownloader:
                         "preferredquality": "192",
                     }]
                 else:
-                    q = self.quality_var.get()
-                    ydl_opts["format"] = QUALITY_MAP.get(q, QUALITY_MAP["720p"])
+                    ydl_opts["format"] = QUALITY_MAP.get(quality, QUALITY_MAP["720p"])
+                    ydl_opts["merge_output_format"] = "mp4"
                     ydl_opts["postprocessors"] = [{
                         "key":             "FFmpegVideoRemuxer",
-                        "preferredformat": "mp4",
+                        "preferedformat":  "mp4",
                     }]
 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
 
-                self.root.after(0, lambda: self._item_finished(item, self.download_path.get()))
+                self.root.after(0, lambda: self._item_finished(item, dest))
 
             except Exception as exc:
-                self.root.after(0, lambda: self._item_error(item, str(exc)[:120]))
+                # `exc` n'existe plus après le bloc except : on copie le message.
+                msg = str(exc)[:120]
+                self.root.after(0, lambda m=msg: self._item_error(item, m))
 
             finally:
                 self.root.after(0, lambda: self.download_btn.configure(
@@ -753,7 +780,7 @@ class YouTubeDownloader:
             eta_str   = fmt_eta(eta)
             right     = f"{speed_str}  {eta_str}".strip()
 
-            self.root.after(0, lambda p=pct: item["bar"].set(p / 100))
+            self.root.after(0, lambda p=pct: item["bar"].set(min(p / 100, 1.0)))
             self.root.after(0, lambda p=pct: item["pct_lbl"].configure(text=f"{p:.1f}%"))
             self.root.after(0, lambda s=right: item["speed_lbl"].configure(text=s))
             self.root.after(0, lambda: self._item_set_status(item, "Téléchargement en cours", SUCCESS))

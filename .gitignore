@@ -1,2 +1,7 @@
 venv/
 .DS_Store
+build/
+dist/
+YTB_DWNL.spec
+logo.ico
+__pycache__/
